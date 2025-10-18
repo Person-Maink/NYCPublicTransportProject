@@ -1,0 +1,23 @@
+Node_1,Node_2,Edge_Betweenness_Centrality
+Eltingville,Great Kills,0.49523809523809526
+Annadale,Eltingville,0.46666666666666673
+St George,Great Kills,0.45238095238095244
+Annadale,Huguenot,0.4285714285714286
+Huguenot,Prince's Bay,0.380952380952381
+Pleasant Plains,Prince's Bay,0.3238095238095238
+St George,Tompkinsville,0.2880952380952381
+New Dorp,St George,0.27380952380952384
+Pleasant Plains,Richmond Valley,0.2571428571428572
+New Dorp,Grant City,0.25
+Tompkinsville,Stapleton,0.23571428571428574
+Jefferson Av,Grant City,0.19761904761904764
+Stapleton,Clifton,0.18333333333333335
+Arthur Kill,Richmond Valley,0.18095238095238098
+Jefferson Av,Dongan Hills,0.14523809523809525
+Grasmere,Clifton,0.13095238095238096
+Bay Terrace,Great Kills,0.10952380952380954
+Arthur Kill,Tottenville,0.09523809523809525
+Old Town,Dongan Hills,0.09285714285714286
+Old Town,Grasmere,0.08333333333333334
+Bay Terrace,Oakwood Heights,0.07142857142857144
+New Dorp,Oakwood Heights,0.07142857142857144
