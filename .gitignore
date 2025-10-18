@@ -6,8 +6,12 @@ dist/
 wheels/
 *.egg-info
 src/data
+src/outputs
 
 # Virtual environments
 .venv
+
+# mac stuff
+.DS_Store
 
 202408-citibike-tripdata/
