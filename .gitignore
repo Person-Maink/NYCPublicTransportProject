@@ -14,4 +14,7 @@ data/
 # mac stuff
 .DS_Store
 
+# Environment variables
+.env
+
 202408-citibike-tripdata/
