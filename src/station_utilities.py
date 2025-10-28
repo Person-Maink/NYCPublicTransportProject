@@ -42,6 +42,7 @@ class StationFinder:
         # Extract station coordinates
         self.citibike_stations = self._extract_citibike_coords()
         self.subway_stations = self._extract_subway_coords()
+        self.original_subway_station_names = set(self.subway_stations['station_name'].values)
         
     def _load_citibike_graph(self) -> nx.DiGraph:
         """Load the Citibike graph from GML file."""

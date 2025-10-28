@@ -1,3 +1,4 @@
+import math
 import sys
 import folium
 import pandas as pd
@@ -70,7 +71,7 @@ class Simulator:
         return stations
     
 
-    def pre_calculate_nearest_stations(self, points: pd.DataFrame, mode: str, radius_km: float = 1.0) -> List[Optional[Tuple[float, float]]]:
+    def pre_calculate_nearest_stations(self, points: pd.DataFrame, mode: str, radius_km: float = 1.0) -> List[Optional[pd.Series]]:
         """
         Pre-calculates the nearest station for all points.
 
@@ -80,8 +81,8 @@ class Simulator:
             radius_km (float): The search radius for nearby stations.
 
         Returns:
-            List[Optional[Tuple[float, float]]]: List of nearest station coordinates for each point.
-                                                   None if no station is found.
+            List[Optional[pd.Series]]: List of nearest station series for each point.
+                                           None if no station is found.
         """
         nearest_stations = []
         
@@ -89,9 +90,8 @@ class Simulator:
             location = (row['latitude'], row['longitude'])
             try:
                 station = self.get_nearby_stations(location, radius_km=radius_km)[mode].iloc[0]
-                station_coord = (station['latitude'], station['longitude'])
-                nearest_stations.append(station_coord)
-            except IndexError:
+                nearest_stations.append(station)
+            except (IndexError, KeyError):
                 print(f"Warning: No {mode} station found within {radius_km}km for point {location}")
                 nearest_stations.append(None)
         
@@ -125,6 +125,7 @@ class Simulator:
         if station_name not in self.subway_stations:
             print(f"Inserting new station: {station_name} at {station_coords}")
             self.subway_stations.loc[len(self.subway_stations)] = [station_name, station_coords[0], station_coords[1]]
+        self.subway_stations = self.finder.subway_stations
     
     
     def batch_distance_matrix_call(self, origins: List[Tuple[float, float]], 
@@ -238,9 +239,41 @@ class Simulator:
                 total_time_seconds += bike_result[0]['legs'][0]['duration']['value']
                 
             elif mode == 'subway':
-                transit_dist = hs.haversine(src_station_coord, dst_station_coord, unit=Unit.KILOMETERS)
-                transit_time = (transit_dist / self.METRO_SPEED) * 3600
-                total_time_seconds += transit_time
+                is_virtual_station = src_station['station_name'] not in self.finder.original_subway_station_names
+
+                if is_virtual_station:
+                    # Find the nearest real subway station to the virtual station
+                    
+                    nearest_real_station = self.get_nearby_stations(src_station_coord, radius_km=radius_km)[mode].iloc[1] # iloc[0] would be the virtual station itself
+
+                    if nearest_real_station is None:
+                        raise Exception("Could not find a nearby real subway station for the virtual station.")
+
+                    nearest_real_station_coord = (nearest_real_station['latitude'], nearest_real_station['longitude'])
+
+                    # Time from virtual to nearest real station
+                    time_to_real_station = (nearest_real_station['distance_km'] / self.METRO_SPEED) * 3600
+                    total_time_seconds += time_to_real_station
+
+                    # Time from nearest real to destination station using Google Maps
+                    transit_result = self.gmaps.directions(nearest_real_station_coord, dst_station_coord, mode="transit", transit_mode="subway")
+                    if not transit_result:
+                        raise Exception(f"Google Maps could not find transit route for Leg 2: {nearest_real_station_coord} to {dst_station_coord}")
+                    total_time_seconds += transit_result[0]['legs'][0]['duration']['value']
+                    
+                    # Update route points to show the path via the real station
+                    route_points = [src, src_station_coord, nearest_real_station_coord, dst_station_coord, dst]
+
+                else: # Real station
+                    transit_result = self.gmaps.directions(src_station_coord, dst_station_coord, mode="transit")
+                    if not transit_result:
+                        # Fallback to haversine if API fails
+                        print(f"Warning: Google Maps transit route not found between {src_station_coord} and {dst_station_coord}. Falling back to haversine distance.")
+                        transit_dist = hs.haversine(src_station_coord, dst_station_coord, unit=Unit.KILOMETERS)
+                        transit_time = (transit_dist / self.METRO_SPEED) * 3600
+                        total_time_seconds += transit_time
+                    else:
+                        total_time_seconds += transit_result[0]['legs'][0]['duration']['value']
 
             # --- Leg 3: Walk from dst_station to dst ---
             walk_2_result = self.gmaps.directions(dst_station_coord, dst, mode="walking")
@@ -256,22 +289,15 @@ class Simulator:
     
 
     def calculate_travel_time_matrix(self, start_points: pd.DataFrame, end_points: pd.DataFrame, 
-                                    mode: str, radius_km: float = 1.0,
-                                    use_batch_api: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+                                    mode: str, radius_km: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
         """
         Calculates matrices of travel times and routes using optimized methods.
-
-        Optimizations:
-        1. Pre-calculates nearest stations for all points (O(1) lookup vs O(N) search)
-        2. Uses batched Distance Matrix API calls (reduces API calls from N*M*3 to ~3)
-        3. Can use parallelization for remaining calculations
 
         Args:
             start_points (pd.DataFrame): A DataFrame with 'latitude' and 'longitude' for starting locations.
             end_points (pd.DataFrame): A DataFrame with 'latitude' and 'longitude' for ending locations.
             mode (str): The mode of transportation ('citibike' or 'subway').
             radius_km (float): The search radius for nearby stations.
-            use_batch_api (bool): Whether to use Distance Matrix API for batched calls.
 
         Returns:
             Tuple[np.ndarray, np.ndarray]: A tuple containing:
@@ -281,150 +307,110 @@ class Simulator:
         num_starts = len(start_points)
         num_ends = len(end_points)
         
-        travel_time_matrix = np.zeros((num_starts, num_ends))
+        travel_time_matrix = np.full((num_starts, num_ends), np.nan)
         route_matrix = np.empty((num_starts, num_ends), dtype=object)
         
         print(f"Pre-calculating nearest {mode} stations...")
         # Pre-calculate nearest stations
-        src_stations = self.pre_calculate_nearest_stations(start_points, mode, radius_km)
-        dst_stations = self.pre_calculate_nearest_stations(end_points, mode, radius_km)
+        src_stations_series = self.pre_calculate_nearest_stations(start_points, mode, radius_km)
+        dst_stations_series = self.pre_calculate_nearest_stations(end_points, mode, radius_km)
         
         # Check for any None values (points without nearby stations)
-        valid_src_indices = [i for i, s in enumerate(src_stations) if s is not None]
-        valid_dst_indices = [j for j, s in enumerate(dst_stations) if s is not None]
+        valid_src_indices = [i for i, s in enumerate(src_stations_series) if s is not None]
+        valid_dst_indices = [j for j, s in enumerate(dst_stations_series) if s is not None]
         
         if not valid_src_indices or not valid_dst_indices:
             print("Warning: Some points have no nearby stations. Results will contain NaN values.")
             return travel_time_matrix, route_matrix
         
-        # Extract valid coordinates
-        start_coords = [(start_points.iloc[i]['latitude'], start_points.iloc[i]['longitude']) 
-                       for i in valid_src_indices]
-        end_coords = [(end_points.iloc[j]['latitude'], end_points.iloc[j]['longitude']) 
-                     for j in valid_dst_indices]
-        valid_src_stations = [src_stations[i] for i in valid_src_indices]
-        valid_dst_stations = [dst_stations[j] for j in valid_dst_indices]
+        total_pairs = num_starts * num_ends
         
-        if use_batch_api:
-            print("Using batched Distance Matrix API calls...")
+        for i, j in tqdm(itertools.product(range(num_starts), range(num_ends)), total=total_pairs, desc=f"Calculating {mode} travel times"):
+            if src_stations_series[i] is None or dst_stations_series[j] is None:
+                route_matrix[i, j] = []
+                continue
             
-            # Leg 1: Walk from start points to their nearest stations
-            print("  - Calculating walk times to origin stations...")
-            walk_to_src_matrix = self.batch_distance_matrix_call(
-                origins=start_coords,
-                destinations=valid_src_stations,
-                mode='walking'
-            )
+            src = (start_points.iloc[i]['latitude'], start_points.iloc[i]['longitude'])
+            dst = (end_points.iloc[j]['latitude'], end_points.iloc[j]['longitude'])
+            src_station_series = src_stations_series[i]
+            dst_station_series = dst_stations_series[j]
+            src_station_coord = (src_station_series['latitude'], src_station_series['longitude'])
+            dst_station_coord = (dst_station_series['latitude'], dst_station_series['longitude'])
             
-            # Leg 2: Transit between stations
-            if mode == 'citibike':
-                print("  - Calculating bike times between stations...")
-                # Get unique station pairs to avoid duplicate API calls
-                unique_station_pairs = list(set(itertools.product(valid_src_stations, valid_dst_stations)))
-                unique_src = [pair[0] for pair in unique_station_pairs]
-                unique_dst = [pair[1] for pair in unique_station_pairs]
+            try:
+                total_time = 0
+                route_points = [src, src_station_coord, dst_station_coord, dst]
                 
-                transit_time_lookup = self.batch_distance_matrix_call(
-                    origins=unique_src,
-                    destinations=unique_dst,
-                    mode='bicycling'
-                )
+                # Leg 1: Walk to station
+                walk_1 = self.gmaps.directions(src, src_station_coord, mode="walking")
+                if walk_1: 
+                    total_time += walk_1[0]['legs'][0]['duration']['value']
+                else: raise Exception("No walking route found for Leg 1")
                 
-                # Build lookup dictionary
-                transit_dict = {}
-                for idx, (src, dst) in enumerate(unique_station_pairs):
-                    transit_dict[(src, dst)] = transit_time_lookup[idx // len(unique_dst), idx % len(unique_dst)]
+                # Leg 2: Transit
+                if mode == 'citibike':
+                    bike = self.gmaps.directions(src_station_coord, dst_station_coord, mode="bicycling")
+                    if bike: 
+                        total_time += bike[0]['legs'][0]['duration']['value']
+                    else: raise Exception("No biking route found")
                 
-            elif mode == 'subway':
-                print("  - Calculating subway times using Haversine...")
-                # Use Haversine for subway (fast, local calculation)
-                transit_dict = {}
-                for src_station in valid_src_stations:
-                    for dst_station in valid_dst_stations:
-                        dist = hs.haversine(src_station, dst_station, unit=Unit.KILOMETERS)
-                        time = (dist / self.METRO_SPEED) * 3600
-                        transit_dict[(src_station, dst_station)] = time
+                elif mode == 'subway':
+                    is_virtual = src_station_series['station_name'] not in self.finder.original_subway_station_names
+                    if is_virtual:
+                        # print('---Starting from virtual station---')
+                        nearest_real_station = self.get_nearby_stations(src_station_coord, radius_km=10.0)[mode].iloc[1] # iloc[0] would be the virtual station itself
 
-            # Leg 3: Walk from destination stations to end points
-            print("  - Calculating walk times from destination stations...")
-            walk_from_dst_matrix = self.batch_distance_matrix_call(
-                origins=valid_dst_stations,
-                destinations=end_coords,
-                mode='walking'
-            )
-            
-            # Combine all legs
-            print(" - Combining travel time legs...")
-            for i_idx, i in enumerate(valid_src_indices):
-                for j_idx, j in enumerate(valid_dst_indices):
-                    src_station = valid_src_stations[i_idx]
-                    dst_station = valid_dst_stations[j_idx]
-                    
-                    # Extract diagonal elements (start[i] -> its nearest station)
-                    walk_to = walk_to_src_matrix[i_idx, i_idx]
-                    walk_from = walk_from_dst_matrix[j_idx, j_idx]
-                    transit = transit_dict.get((src_station, dst_station), np.nan)
-                    
-                    if not np.isnan(walk_to) and not np.isnan(walk_from) and not np.isnan(transit):
-                        travel_time_matrix[i, j] = walk_to + transit + walk_from
+                        if nearest_real_station is None:
+                            raise Exception("Could not find a nearby real subway station for the virtual station.")
+
+                        nearest_real_coords = (nearest_real_station['latitude'], nearest_real_station['longitude'])
                         
-                        # Build route points
-                        src = (start_points.iloc[i]['latitude'], start_points.iloc[i]['longitude'])
-                        dst = (end_points.iloc[j]['latitude'], end_points.iloc[j]['longitude'])
-                        route_matrix[i, j] = [src, src_station, dst_station, dst]
-                    else:
-                        travel_time_matrix[i, j] = np.nan
-                        route_matrix[i, j] = []
-        
-        else:
-            # Option to use Directions API instead
-            print("Using original method with pre-calculated stations...")
-            for i in tqdm(range(num_starts), desc=f"Calculating {mode} travel times"):
-                for j in range(num_ends):
-                    if src_stations[i] is None or dst_stations[j] is None:
-                        travel_time_matrix[i, j] = np.nan
-                        route_matrix[i, j] = []
-                        continue
-                    
-                    src = (start_points.iloc[i]['latitude'], start_points.iloc[i]['longitude'])
-                    dst = (end_points.iloc[j]['latitude'], end_points.iloc[j]['longitude'])
-                    src_station_coord = src_stations[i]
-                    dst_station_coord = dst_stations[j]
-                    
-                    try:
-                        total_time = 0
+                        virtual_to_real_time = math.ceil((nearest_real_station['distance_km'] / self.METRO_SPEED) * 3600)
+                        total_time += virtual_to_real_time
+                        # print(f'virtual station -> nearest real station: ~{virtual_to_real_time}s')
                         
-                        # Leg 1: Walk to station
-                        walk_1 = self.gmaps.directions(src, src_station_coord, mode="walking")
-                        if walk_1:
-                            total_time += walk_1[0]['legs'][0]['duration']['value']
-                        else:
-                            raise Exception("No walking route found")
-                        
-                        # Leg 2: Transit
-                        if mode == 'citibike':
-                            bike = self.gmaps.directions(src_station_coord, dst_station_coord, mode="bicycling")
-                            if bike:
-                                total_time += bike[0]['legs'][0]['duration']['value']
-                            else:
-                                raise Exception("No biking route found")
-                        else:
+                        transit_result = self.gmaps.directions(nearest_real_coords, dst_station_coord, mode="transit", transit_mode="subway")
+
+                        if not transit_result: 
                             dist = hs.haversine(src_station_coord, dst_station_coord, unit=Unit.KILOMETERS)
-                            total_time += (dist / self.METRO_SPEED) * 3600
-                        
-                        # Leg 3: Walk from station
-                        walk_2 = self.gmaps.directions(dst_station_coord, dst, mode="walking")
-                        if walk_2:
-                            total_time += walk_2[0]['legs'][0]['duration']['value']
+                            subway_transit_time = math.ceil((dist / self.METRO_SPEED) * 3600)
+                            total_time += subway_transit_time
+                            # print(f'Total transit time {subway_transit_time}s')
                         else:
-                            raise Exception("No walking route found")
-                        
-                        travel_time_matrix[i, j] = total_time
-                        route_matrix[i, j] = [src, src_station_coord, dst_station_coord, dst]
-                        
-                    except Exception as e:
-                        travel_time_matrix[i, j] = np.nan
-                        route_matrix[i, j] = []
+                            subway_transit_time = transit_result[0]['legs'][0]['duration']['value']
+                            total_time += subway_transit_time
+                            # print(f'real src station -> dst station: {subway_transit_time}s')
+
+                        route_points = [src, src_station_coord, nearest_real_coords, dst_station_coord, dst]
+
+                        # print(f'Total transit time: ~{virtual_to_real_time+subway_transit_time}s')
+
+                    else:
+                        # print('---Starting from real station---')
+                        transit_result = self.gmaps.directions(src_station_coord, dst_station_coord, mode="transit", transit_mode="subway")
+                        if transit_result: 
+                            subway_transit_time = transit_result[0]['legs'][0]['duration']['value']
+                            total_time += subway_transit_time
+                            # print(f'Total transit time {subway_transit_time}s')
+                        else:
+                            print("No transit route found, fallback to haversine distance.")
+                            dist = hs.haversine(src_station_coord, dst_station_coord, unit=Unit.KILOMETERS)
+                            subway_transit_time = math.ceil((dist / self.METRO_SPEED) * 3600)
+                            total_time += subway_transit_time
+                            # print(f'Total transit time {subway_transit_time}s')
+                
+                # Leg 3: Walk from station
+                walk_2 = self.gmaps.directions(dst_station_coord, dst, mode="walking")
+                if walk_2: 
+                    total_time += walk_2[0]['legs'][0]['duration']['value']
+                else: raise Exception("No walking route found for Leg 3")
+                
+                travel_time_matrix[i, j] = total_time
+                route_matrix[i, j] = route_points
+                
+            except Exception as e:
+                travel_time_matrix[i, j] = np.nan
+                route_matrix[i, j] = []
 
         return travel_time_matrix, route_matrix
     
