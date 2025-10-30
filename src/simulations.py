@@ -149,6 +149,21 @@ class Simulator:
             print(f"Inserting new station: {station_name} at {station_coords}")
             self.subway_stations.loc[len(self.subway_stations)] = [station_name, station_coords[0], station_coords[1]]
         self.subway_stations = self.finder.subway_stations
+
+    def remove_station(self, station_name: str) -> None:
+        """
+        Removes a station from the self.subway_stations dataframe.
+
+        Args:
+            station_name (str): The name of the station to remove.
+        """
+        # Check if the station exists before trying to remove it
+        if station_name in self.subway_stations['station_name'].values:
+            print(f"Removing station: {station_name}")
+            # Keep all rows where the station_name does not match the one to be removed
+            self.subway_stations = self.subway_stations[self.subway_stations['station_name'] != station_name].reset_index(drop=True)
+        else:
+            print(f"Station '{station_name}' not found. Nothing to remove.")
     
     
     def batch_distance_matrix_call(self, origins: List[Tuple[float, float]], 
@@ -357,8 +372,8 @@ class Simulator:
         travel_time_matrix = np.full((num_starts, num_ends), np.nan)
         route_matrix = np.empty((num_starts, num_ends), dtype=object)
         
-        src_stations_series = self.pre_calculate_nearest_stations(start_points, mode, radius_km=5.0)
-        dst_stations_series = self.pre_calculate_nearest_stations(end_points, mode, radius_km=5.0)
+        src_stations_series = self.pre_calculate_nearest_stations(start_points, mode, radius_km=3.0)
+        dst_stations_series = self.pre_calculate_nearest_stations(end_points, mode, radius_km=3.0)
         
         valid_src_indices = [i for i, s in enumerate(src_stations_series) if s is not None]
         valid_dst_indices = [j for j, s in enumerate(dst_stations_series) if s is not None]
@@ -440,7 +455,7 @@ class Simulator:
                     is_virtual = src_station_series['station_name'] not in self.finder.original_subway_station_names
                     if is_virtual:
                         # print(f'Point ({i, j}) ->>> {src_station_series["station_name"]}')
-                        nearest_real_station = self.get_nearby_stations(src_station_coord, radius_km=5.0)[mode].iloc[1]
+                        nearest_real_station = self.get_nearby_stations(src_station_coord, radius_km=3.0)[mode].iloc[1]
                         if nearest_real_station is None: raise Exception("Could not find a nearby real subway station.")
                         nearest_real_coords = (nearest_real_station['latitude'], nearest_real_station['longitude'])
                         virtual_to_real_time = math.ceil((nearest_real_station['distance_km'] / self.METRO_SPEED) * 3600)
